@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nederlands – карточки (Contact! 1)</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#f4f1ea;color:#222;display:flex;flex-direction:column;align-items:center;min-height:100vh;padding:16px}
+  h1{font-size:1.3rem;margin:8px 0 4px;color:#c4561b}
+  .stats{font-size:.95rem;color:#555;margin-bottom:12px;text-align:center}
+  .card{width:100%;max-width:520px;min-height:300px;background:#fff;border-radius:18px;box-shadow:0 6px 24px rgba(0,0,0,.1);display:flex;flex-direction:column;align-items:center;justify-content:center;padding:28px;cursor:pointer;user-select:none;text-align:center}
+  .nl{font-size:3rem;font-weight:700;color:#1d3c78;word-break:break-word}
+  .ph{font-size:1.4rem;color:#888;margin-top:10px;font-style:italic}
+  .ru{font-size:2.1rem;margin-top:22px;color:#2a7a3b;min-height:2.6rem}
+  .hint{font-size:.9rem;color:#aaa;margin-top:18px}
+  .tag{font-size:.8rem;color:#999;margin-bottom:10px}
+  .row{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;justify-content:center;width:100%;max-width:520px}
+  button{font-size:1.1rem;padding:14px 18px;border:none;border-radius:12px;cursor:pointer;flex:1;min-width:110px}
+  .nav{background:#e3ded3}
+  .flip{background:#1d3c78;color:#fff}
+  .bad{background:#e05a47;color:#fff}
+  .good{background:#3a9a52;color:#fff}
+  .reset{background:none;color:#999;font-size:.85rem;flex:none;margin-top:14px;text-decoration:underline}
+  button:disabled{opacity:.4;cursor:default}
+</style>
+</head>
+<body>
+<h1>🇳🇱 Nederlands · Contact! Nieuw 1</h1>
+<div class="stats" id="stats"></div>
+<div class="card" id="card" title="Нажмите, чтобы перевернуть">
+  <div class="tag" id="tag"></div>
+  <div class="nl" id="nl"></div>
+  <div class="ph" id="ph"></div>
+  <div class="ru" id="ru"></div>
+  <div class="hint" id="hint">нажмите или пробел — показать перевод</div>
+</div>
+<div class="row">
+  <button class="nav" id="prev">← Назад</button>
+  <button class="flip" id="flip">Перевернуть</button>
+  <button class="nav" id="next">Вперёд →</button>
+</div>
+<div class="row">
+  <button class="bad" id="bad" disabled>✗ Не знаю (1)</button>
+  <button class="good" id="good" disabled>✓ Знаю (2)</button>
+</div>
+<button class="reset" id="reset">Сбросить прогресс</button>
+
+<script>
+// [Dutch, pronunciation hint, Russian, topic]
+const CARDS = [
+ ["de naam","də naam","имя","H1"],
+ ["Hoe heet je?","hu heet jə","Как тебя зовут?","H1"],
+ ["Ik heet ...","ik heet","Меня зовут ...","H1"],
+ ["Wat is je naam?","vat is jə naam","Как твоё имя?","H1"],
+ ["Mijn naam is ...","mein naam is","Моё имя ...","H1"],
+ ["Waar kom je vandaan?","vaar kom jə fandaan","Откуда ты?","H1"],
+ ["Ik kom uit ...","ik kom öyt","Я из ...","H1"],
+ ["Waar woon je?","vaar woon jə","Где ты живёшь?","H1"],
+ ["Ik woon in ...","ik woon in","Я живу в ...","H1"],
+ ["het land","hət lant","страна","H1"],
+ ["de nationaliteit","də naa-sjoo-naa-lie-teit","национальность","H1"],
+ ["de taal","də taal","язык","H1"],
+ ["Welke taal spreek je?","velkə taal spreek jə","На каком языке ты говоришь?","H1"],
+ ["Ik spreek Russisch","ik spreek rüssies","Я говорю по-русски","H1"],
+ ["Nederland","needərlant","Нидерланды","H1"],
+ ["Nederlands","needərlants","нидерландский (язык)","H1"],
+ ["Nederlander","needərlandər","нидерландец","H1"],
+ ["Rusland","rüslant","Россия","H1"],
+ ["Russisch","rüssies","русский (язык)","H1"],
+ ["Engels","engəls","английский (язык)","H1"],
+ ["de leeftijd","də leeftejt","возраст","H1"],
+ ["Hoe oud ben je?","hu out ben jə","Сколько тебе лет?","H1"],
+ ["Ik ben ... jaar","ik ben ... jaar","Мне ... лет","H1"],
+ ["Hallo","hallo","Привет","H1"],
+ ["Goedemorgen","khudə-morkhən","Доброе утро","H1"],
+ ["Dag!","dakh","Привет / Пока","H1"],
+ ["Tot ziens","tot zins","До свидания","H1"],
+ ["Hoe gaat het?","hu khaat hət","Как дела?","H1"],
+ ["Goed, dank je","khut, dank jə","Хорошо, спасибо","H1"],
+ ["Dank u wel","dank ü vel","Спасибо (вежл.)","H1"],
+ ["Alsjeblieft","als-jə-blieft","Пожалуйста","H1"],
+ ["ja / nee","jaa / nee","да / нет","H1"],
+ ["een","een","один (1)","Getallen"],
+ ["twee","tvee","два (2)","Getallen"],
+ ["drie","drie","три (3)","Getallen"],
+ ["vier","fier","четыре (4)","Getallen"],
+ ["vijf","feif","пять (5)","Getallen"],
+ ["zes","zes","шесть (6)","Getallen"],
+ ["zeven","zeevən","семь (7)","Getallen"],
+ ["acht","akht","восемь (8)","Getallen"],
+ ["negen","neekhən","девять (9)","Getallen"],
+ ["tien","tien","десять (10)","Getallen"],
+ ["elf","elf","одиннадцать (11)","Getallen"],
+ ["twaalf","tvaalf","двенадцать (12)","Getallen"],
+ ["dertien","dertien","тринадцать (13)","Getallen"],
+ ["veertien","feertien","четырнадцать (14)","Getallen"],
+ ["vijftien","feiftien","пятнадцать (15)","Getallen"],
+ ["zestien","zestien","шестнадцать (16)","Getallen"],
+ ["zeventien","zeevəntien","семнадцать (17)","Getallen"],
+ ["achttien","akhtien","восемнадцать (18)","Getallen"],
+ ["negentien","neekhəntien","девятнадцать (19)","Getallen"],
+ ["twintig","tvintəkh","двадцать (20)","Getallen"],
+ ["het huis","hət höys","дом","A0"],
+ ["de tafel","də taafəl","стол","A0"],
+ ["de stoel","də stul","стул","A0"],
+ ["het raam","hət raam","окно","A0"],
+ ["de deur","də dör","дверь","A0"],
+ ["het bed","hət bet","кровать","A0"],
+ ["het water","hət vaatər","вода","A0"],
+ ["het brood","hət broot","хлеб","A0"],
+ ["de melk","də melk","молоко","A0"],
+ ["de koffie","də koffie","кофе","A0"],
+ ["de thee","də tee","чай","A0"],
+ ["de kaas","də kaas","сыр","A0"],
+ ["de appel","də appəl","яблоко","A0"],
+ ["het boek","hət buk","книга","A0"],
+ ["de fiets","də fiets","велосипед","A0"],
+ ["de man","də man","мужчина","A0"],
+ ["de vrouw","də frau","женщина","A0"],
+ ["het kind","hət kint","ребёнок","A0"],
+ ["de dag","də dakh","день","A0"],
+ ["de stad","də stat","город","A0"]
+];
+// Pronunciation hints: kh = гортанный "г/х", ö ≈ "ё" губами, ü ≈ "ю" коротко, ə = безударный звук.
+
+const KEY = "nl-flashcards-v1";
+const STEPS = [0, 1, 5, 20, 60, 180, 600]; // minutes until the card comes back, by level
+const MIN = 60000;
+let st = load();
+let order = [], pos = 0, flipped = false;
+
+function load(){ try{ return JSON.parse(localStorage.getItem(KEY)) || {}; }catch(e){ return {}; } }
+function save(){ localStorage.setItem(KEY, JSON.stringify(st)); }
+function info(i){ return st[i] || (st[i] = {lvl:0, due:0, seen:0}); }
+
+function buildOrder(){
+  const now = Date.now();
+  const idx = CARDS.map((_,i)=>i);
+  const due = idx.filter(i=>info(i).due <= now).sort((a,b)=>info(a).due-info(b).due || info(a).lvl-info(b).lvl);
+  const later = idx.filter(i=>info(i).due > now).sort((a,b)=>info(a).due-info(b).due);
+  order = due.concat(later); pos = 0;
+}
+
+function render(){
+  const i = order[pos], c = CARDS[i], s = info(i);
+  $("tag").textContent = c[3] + " · уровень " + s.lvl;
+  $("nl").textContent = c[0];
+  $("ph").textContent = "[" + c[1] + "]";
+  $("ru").textContent = flipped ? c[2] : "";
+  $("hint").style.display = flipped ? "none" : "";
+  $("good").disabled = $("bad").disabled = !flipped;
+  $("prev").disabled = pos === 0;
+  const now = Date.now();
+  const dueN = CARDS.filter((_,k)=>info(k).due <= now).length;
+  const known = CARDS.filter((_,k)=>info(k).lvl >= 3).length;
+  $("stats").textContent = `Карточка ${pos+1}/${order.length} · к повторению: ${dueN} · выучено: ${known}/${CARDS.length}`;
+}
+
+function answer(ok){
+  const s = info(order[pos]);
+  s.lvl = ok ? Math.min(s.lvl + 1, STEPS.length - 1) : 0;
+  s.due = Date.now() + (ok ? STEPS[s.lvl] * MIN : 0);
+  s.seen++; save();
+  if(!ok){ // unknown: show it again 3 cards later
+    const id = order.splice(pos,1)[0];
+    order.splice(Math.min(pos+3, order.length), 0, id);
+  } else {
+    pos++;
+  }
+  if(pos >= order.length) buildOrder();
+  flipped = false; render();
+}
+
+function $(id){ return document.getElementById(id); }
+function flip(){ flipped = !flipped; render(); }
+$("card").onclick = flip; $("flip").onclick = flip;
+$("next").onclick = ()=>{ pos = (pos+1) % order.length; flipped=false; render(); };
+$("prev").onclick = ()=>{ if(pos>0){pos--; flipped=false; render();} };
+$("good").onclick = ()=>answer(true);
+$("bad").onclick = ()=>answer(false);
+$("reset").onclick = ()=>{ if(confirm("Сбросить весь прогресс?")){ st={}; save(); buildOrder(); flipped=false; render(); } };
+document.addEventListener("keydown", e=>{
+  if(e.key===" "){ e.preventDefault(); flip(); }
+  else if(e.key==="ArrowRight") $("next").click();
+  else if(e.key==="ArrowLeft") $("prev").click();
+  else if(e.key==="1" && flipped) answer(false);
+  else if(e.key==="2" && flipped) answer(true);
+});
+buildOrder(); render();
+</script>
+</body>
+</html>
