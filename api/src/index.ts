@@ -1,7 +1,7 @@
 // dutch-api: sync backend + read-only MCP endpoint for the Dutch flashcards app.
 // Cloudflare Workers free tier + D1. No runtime dependencies.
 
-export interface Env { DB: D1Database }
+export interface Env { DB: D1Database; MCP_ALLOWED_ORIGINS?: string }
 
 const ALLOWED_ORIGIN = "https://forcewake.github.io";
 const KNOWN_LEVEL = 3;
@@ -464,21 +464,6 @@ async function applySync(env: Env, userId: string, body: any): Promise<{ applied
 
 class HttpError extends Error { constructor(public status: number, msg: string) { super(msg); } }
 
-// ---------- MCP (Streamable HTTP, stateless, JSON responses) ----------
-const PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
-const TOOLS = [
-  { name: "get_summary", description: "Overall learning summary: cards total/seen/known/due, accuracy over the last 7 days, streak info.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false } },
-  { name: "get_struggling", description: "Cards the learner gets wrong most often (by wrong count, then low level).",
-    inputSchema: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 100, default: 10 } }, additionalProperties: false } },
-  { name: "get_due_cards", description: "Cards whose review is due now (seen cards with due_at <= now), plus count of never-seen cards.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false } },
-  { name: "get_current_session", description: "The most recent study session (events separated by gaps < 30 min): every flip/answer/position event with card word+translation, current card, duration, answers right/wrong. Use to see live activity.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false } },
-  { name: "get_recent_activity", description: "Answer events per day over the last N days, with accuracy and the cards reviewed.",
-    inputSchema: { type: "object", properties: { days: { type: "integer", minimum: 1, maximum: 90, default: 7 } }, additionalProperties: false } },
-];
-
 function cardView(r: Row, now: number) {
   const m = CARD_META[r.card_id];
   return { card_id: r.card_id, dutch: m?.[0] ?? null, russian: m?.[1] ?? null, topic: m?.[2] ?? null,
@@ -581,55 +566,352 @@ async function currentSession(env: Env, userId: string, now: number) {
     flips: evs.filter(e => e.type === "flip").length, distinct_cards: new Set(evs.map(e => e.card_id).filter(Boolean)).size,
     event_count: evs.length, events: evs.slice(-300).map(evView), events_truncated: evs.length > 300 } };
 }
-class RpcError extends Error { constructor(public code: number, msg: string) { super(msg); } }
+// ---------- MCP (Streamable HTTP, dual-era, stateless) ----------
+// Modern (2026-07-28): no initialize; every request carries _meta protocolVersion + clientCapabilities,
+//   mirrored in MCP-Protocol-Version / Mcp-Method / Mcp-Name headers; server/discover; resultType; ttlMs/cacheScope.
+// Legacy (2025-11-25, 2025-06-18, 2025-03-26): initialize handshake, ping, no sessions minted (stateless),
+//   JSON-RPC batches only for 2025-03-26 (removed in 2025-06-18).
+const MODERN_VERSIONS = ["2026-07-28"];
+const LEGACY_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"];
+const SUPPORTED_VERSIONS = [...MODERN_VERSIONS, ...LEGACY_VERSIONS];
+const SERVER_INFO = { name: "dutch-flashcards", title: "Dutch flashcards progress", version: "2.0.0" };
+const INSTRUCTIONS = "Read-only access to Pavel's Dutch flashcard progress (Contact! Nieuw 1 deck, Russian translations). " +
+  "Levels 0-6; level >= 3 counts as known. Times are ISO-8601 UTC. Use get_current_session to see live activity, " +
+  "get_struggling for weak cards, get_summary for an overview.";
+const PAGE_SIZE = 50;
+const E = { PARSE: -32700, INVALID_REQUEST: -32600, METHOD_NOT_FOUND: -32601, INVALID_PARAMS: -32602, INTERNAL: -32603,
+  LEGACY_RESOURCE_NOT_FOUND: -32002, HEADER_MISMATCH: -32020, UNSUPPORTED_VERSION: -32022 } as const;
+
+class RpcError extends Error {
+  constructor(public code: number, msg: string, public data?: unknown, public http = 200) { super(msg); }
+}
+
+// ----- JSON Schemas (2020-12 compatible, also valid draft-07 for older clients) -----
+const S = {
+  str: { type: "string" }, int: { type: "integer" }, num: { type: "number" }, bool: { type: "boolean" },
+  strN: { type: ["string", "null"] }, numN: { type: ["number", "null"] },
+};
+const cardSchema = { type: "object", required: ["card_id", "dutch", "russian", "topic", "level", "seen", "wrong", "due_at", "due_now", "last_seen"],
+  properties: { card_id: { type: "string", description: "Stable slug, e.g. nl:het-huis" }, dutch: S.strN, russian: S.strN, topic: S.strN,
+    level: { type: "integer", minimum: 0 }, seen: { type: "integer", minimum: 0 }, wrong: { type: "integer", minimum: 0 },
+    due_at: { type: "string", format: "date-time" }, due_now: S.bool, last_seen: S.strN } };
+const eventSchema = { type: "object", required: ["ts", "type", "card_id", "dutch", "russian"],
+  properties: { ts: S.str, type: { enum: ["flip", "answer", "position", "session_start"] }, card_id: S.strN, dutch: S.strN, russian: S.strN,
+    ok: S.bool, data: {} } };
+const labelSchema = { type: "object", required: ["card_id", "dutch", "russian"], properties: { card_id: S.str, dutch: S.strN, russian: S.strN } };
+const noArgs = { type: "object", properties: {}, additionalProperties: false };
+const ro = (title: string) => ({ title, readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
+
+const TOOLS = [
+  { name: "get_summary", title: "Learning summary",
+    description: "Overall summary: cards total/seen/known/due/never seen, total reviews and mistakes, answers and accuracy over the last 7 days, last activity, per-topic breakdown.",
+    inputSchema: noArgs, annotations: ro("Learning summary"),
+    outputSchema: { type: "object", required: ["cards_total", "cards_seen", "cards_known", "known_threshold_level", "due_now", "never_seen", "total_reviews", "total_wrong", "last_7_days", "last_activity", "by_topic"],
+      properties: { cards_total: S.int, cards_seen: S.int, cards_known: S.int, known_threshold_level: S.int, due_now: S.int, never_seen: S.int,
+        total_reviews: S.int, total_wrong: S.int, last_activity: S.strN,
+        last_7_days: { type: "object", required: ["answers", "correct", "accuracy", "active_days_utc"], properties: { answers: S.int, correct: S.int, accuracy: S.numN, active_days_utc: S.int } },
+        by_topic: { type: "object", additionalProperties: { type: "object", required: ["total", "seen", "known"], properties: { total: S.int, seen: S.int, known: S.int } } } } } },
+  { name: "get_struggling", title: "Struggling cards",
+    description: "Cards answered wrong most often (sorted by wrong count, then lowest level, then most recent). Includes Dutch word, Russian translation, level and counts.",
+    inputSchema: { type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 100, default: 10, description: "Max cards to return" } }, additionalProperties: false },
+    annotations: ro("Struggling cards"),
+    outputSchema: { type: "object", required: ["cards"], properties: { cards: { type: "array", items: cardSchema } } } },
+  { name: "get_due_cards", title: "Cards due for review",
+    description: "Already-seen cards whose review time has come (due_at <= now), oldest first, plus how many cards were never seen.",
+    inputSchema: noArgs, annotations: ro("Cards due for review"),
+    outputSchema: { type: "object", required: ["now", "due_count", "cards", "never_seen_count"],
+      properties: { now: S.str, due_count: S.int, never_seen_count: S.int, cards: { type: "array", items: cardSchema } } } },
+  { name: "get_current_session", title: "Current study session",
+    description: "The most recent study session (events separated by gaps under 30 minutes): every flip/answer/position event with word and translation, the current card, duration, right/wrong answers, whether it is active now.",
+    inputSchema: noArgs, annotations: ro("Current study session"),
+    outputSchema: { type: "object", required: ["session"], properties: { message: S.str, session: { anyOf: [{ type: "null" }, { type: "object",
+      required: ["started_at", "last_event_at", "duration_minutes", "active_now", "minutes_since_last_event", "current_card", "answers_right", "answers_wrong", "flips", "distinct_cards", "event_count", "events", "events_truncated"],
+      properties: { started_at: S.str, last_event_at: S.str, duration_minutes: S.num, active_now: S.bool, minutes_since_last_event: S.num,
+        current_card: { anyOf: [{ type: "null" }, labelSchema] }, answers_right: S.int, answers_wrong: S.int, flips: S.int, distinct_cards: S.int,
+        event_count: S.int, events_truncated: S.bool, events: { type: "array", items: eventSchema } } }] } } } },
+  { name: "get_recent_activity", title: "Recent activity",
+    description: "Answers per UTC day over the last N days with accuracy, distinct cards and the cards missed that day.",
+    inputSchema: { type: "object", properties: { days: { type: "integer", minimum: 1, maximum: 90, default: 7, description: "How many days back" } }, additionalProperties: false },
+    annotations: ro("Recent activity"),
+    outputSchema: { type: "object", required: ["days", "total_answers", "total_correct", "per_day_utc"],
+      properties: { days: S.int, total_answers: S.int, total_correct: S.int, per_day_utc: { type: "array", items: { type: "object",
+        required: ["date", "answers", "correct", "accuracy", "distinct_cards", "missed"],
+        properties: { date: S.str, answers: S.int, correct: S.int, accuracy: S.num, distinct_cards: S.int, missed: { type: "array", items: labelSchema } } } } } } },
+];
+
+function checkArgs(tool: (typeof TOOLS)[number], args: unknown): string | null {
+  if (args === undefined || args === null) return null;
+  if (typeof args !== "object" || Array.isArray(args)) return "arguments must be an object";
+  const props = (tool.inputSchema as any).properties as Record<string, any>;
+  for (const [k, v] of Object.entries(args as Record<string, unknown>)) {
+    const p = props[k];
+    if (!p) return `unknown argument '${k}'`;
+    if (p.type === "integer" && (typeof v !== "number" || !Number.isInteger(v) || v < p.minimum || v > p.maximum))
+      return `'${k}' must be an integer between ${p.minimum} and ${p.maximum}`;
+  }
+  return null;
+}
+
+// ----- resources -----
+const RESOURCES = [
+  { uri: "dutch://summary", name: "summary", title: "Learning summary", description: "Same data as the get_summary tool.", mimeType: "application/json" },
+  { uri: "dutch://cards", name: "cards", title: "All cards with progress", description: "Every card in the deck (id, Dutch, Russian, topic) with its current progress.", mimeType: "application/json" },
+  { uri: "dutch://struggling", name: "struggling", title: "Struggling cards (top 20)", description: "Same data as get_struggling with limit 20.", mimeType: "application/json" },
+  { uri: "dutch://session/current", name: "current-session", title: "Current study session", description: "Same data as get_current_session.", mimeType: "application/json" },
+];
+const TEMPLATES = [
+  { uriTemplate: "dutch://cards/{card_id}", name: "card", title: "One card", description: "One card with progress and its last 50 events. card_id is a slug like nl:het-huis.", mimeType: "application/json" },
+];
+async function readResource(env: Env, userId: string, uri: string, modern: boolean): Promise<unknown> {
+  const now = Date.now();
+  const notFound = () => new RpcError(modern ? E.INVALID_PARAMS : E.LEGACY_RESOURCE_NOT_FOUND, `Resource not found: ${uri}`, { uri }, modern ? 400 : 200);
+  switch (uri) {
+    case "dutch://summary": return callTool(env, userId, "get_summary", {});
+    case "dutch://struggling": return callTool(env, userId, "get_struggling", { limit: 20 });
+    case "dutch://session/current": return currentSession(env, userId, now);
+    case "dutch://cards": {
+      const prog = new Map((await rows(env, userId)).map(r => [r.card_id, r]));
+      return { cards: Object.entries(CARD_META).map(([id, [dutch, russian, topic]]) => {
+        const r = prog.get(id);
+        return { card_id: id, dutch, russian, topic, level: r?.level ?? 0, seen: r?.seen ?? 0, wrong: r?.wrong ?? 0,
+          due_at: r && r.seen ? new Date(r.due_at).toISOString() : null, last_seen: r?.last_seen ? new Date(r.last_seen).toISOString() : null };
+      }) };
+    }
+  }
+  const m = uri.match(/^dutch:\/\/cards\/(.+)$/);
+  if (m) {
+    let id: string; try { id = decodeURIComponent(m[1]); } catch { throw notFound(); }
+    const meta = CARD_META[id];
+    if (!meta) throw notFound();
+    const r = await env.DB.prepare("SELECT card_id, level, due_at, last_seen, seen, wrong, updated_at FROM progress WHERE user_id = ? AND card_id = ?").bind(userId, id).first<Row>();
+    const { results } = await env.DB.prepare("SELECT card_id, type, ok, data, ts FROM events WHERE user_id = ? AND card_id = ? ORDER BY ts DESC LIMIT 50").bind(userId, id).all<Ev>();
+    return { card: r ? cardView(r, now) : { card_id: id, dutch: meta[0], russian: meta[1], topic: meta[2], level: 0, seen: 0, wrong: 0, due_at: null, due_now: true, last_seen: null },
+      recent_events: results.map(evView) };
+  }
+  throw notFound();
+}
+
+function paginate<T>(items: T[], cursor: unknown, kind: string): { page: T[]; nextCursor?: string } {
+  let start = 0;
+  if (cursor !== undefined && cursor !== null) {
+    try {
+      const c = JSON.parse(atob(String(cursor).replace(/-/g, "+").replace(/_/g, "/")));
+      if (c.k !== kind || !Number.isInteger(c.o) || c.o < 0 || c.o > items.length) throw 0;
+      start = c.o;
+    } catch { throw new RpcError(E.INVALID_PARAMS, "Invalid cursor", undefined, 400); }
+  }
+  const end = start + PAGE_SIZE;
+  return { page: items.slice(start, end), ...(end < items.length ? { nextCursor: btoa(JSON.stringify({ k: kind, o: end })).replace(/=+$/, "") } : {}) };
+}
+
+// ----- dispatch -----
+type Ctx = { env: Env; userId: string; modern: boolean; version: string };
+async function dispatch(ctx: Ctx, method: string, params: any): Promise<Record<string, unknown>> {
+  const { env, userId, modern } = ctx;
+  const capabilities = { tools: { listChanged: false }, resources: { listChanged: false, subscribe: false } };
+  const cache = (ttlMs: number, cacheScope: "public" | "private") => modern ? { ttlMs, cacheScope } : {};
+  switch (method) {
+    case "initialize": // legacy only (handled before for version negotiation)
+      return { protocolVersion: ctx.version, capabilities, serverInfo: SERVER_INFO, instructions: INSTRUCTIONS };
+    case "server/discover":
+      return { supportedVersions: SUPPORTED_VERSIONS, capabilities, instructions: INSTRUCTIONS, ...cache(3600000, "public") };
+    case "tools/list": {
+      const p = paginate(TOOLS, params?.cursor, "tools");
+      return { tools: p.page, ...(p.nextCursor ? { nextCursor: p.nextCursor } : {}), ...cache(3600000, "public") };
+    }
+    case "tools/call": {
+      const name = params?.name;
+      const tool = TOOLS.find(t => t.name === name);
+      if (!tool) throw new RpcError(E.INVALID_PARAMS, `Unknown tool: ${String(name)}`, undefined, modern ? 400 : 200);
+      const bad = checkArgs(tool, params?.arguments);
+      if (bad) return { content: [{ type: "text", text: `Invalid arguments for ${tool.name}: ${bad}` }], isError: true };
+      const data = await callTool(env, userId, tool.name, params?.arguments ?? {});
+      return { content: [{ type: "text", text: JSON.stringify(data) }], structuredContent: data, isError: false };
+    }
+    case "resources/list": {
+      const p = paginate(RESOURCES, params?.cursor, "resources");
+      return { resources: p.page, ...(p.nextCursor ? { nextCursor: p.nextCursor } : {}), ...cache(3600000, "public") };
+    }
+    case "resources/templates/list": {
+      const p = paginate(TEMPLATES, params?.cursor, "templates");
+      return { resourceTemplates: p.page, ...(p.nextCursor ? { nextCursor: p.nextCursor } : {}), ...cache(3600000, "public") };
+    }
+    case "resources/read": {
+      const uri = params?.uri;
+      if (typeof uri !== "string") throw new RpcError(E.INVALID_PARAMS, "params.uri must be a string", undefined, modern ? 400 : 200);
+      const data = await readResource(env, userId, uri, modern);
+      return { contents: [{ uri, mimeType: "application/json", text: JSON.stringify(data) }], ...cache(0, "private") };
+    }
+    case "ping":
+      if (!modern) return {};
+  }
+  throw new RpcError(E.METHOD_NOT_FOUND, `Method not found: ${method}`, undefined, modern ? 404 : 200);
+}
+
+// ----- HTTP layer -----
+function mcpOriginAllowed(env: Env, origin: string | null): boolean {
+  if (origin === null) return true; // non-browser clients (Grok's servers, SDKs) send no Origin
+  if (origin === ALLOWED_ORIGIN) return true;
+  let parsed: URL; try { parsed = new URL(origin); } catch { return false; } // also rejects the opaque "null" origin
+  if (parsed.origin !== origin) return false;
+  const list = (env.MCP_ALLOWED_ORIGINS ?? "*").split(",").map(s => s.trim()).filter(Boolean);
+  return list.includes("*") || list.includes(origin);
+}
+function mcpCors(origin: string | null, req: Request): Record<string, string> {
+  if (!origin) return {};
+  const reqHeaders = req.headers.get("Access-Control-Request-Headers");
+  return {
+    "Access-Control-Allow-Origin": origin, "Vary": "Origin",
+    "Access-Control-Allow-Methods": "POST, GET, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": reqHeaders && /^[A-Za-z0-9 ,_-]{0,1000}$/.test(reqHeaders) ? reqHeaders
+      : "Authorization, Content-Type, Accept, MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Session-Id, Last-Event-ID",
+    "Access-Control-Expose-Headers": "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate",
+    "Access-Control-Max-Age": "86400",
+  };
+}
+const rpcErr = (id: unknown, code: number, message: string, data?: unknown) =>
+  ({ jsonrpc: "2.0", id: id ?? null, error: { code, message, ...(data !== undefined ? { data } : {}) } });
+function decodeHeaderValue(v: string): string | null {
+  const m = v.match(/^=\?base64\?([A-Za-z0-9+/=]*)\?=$/);
+  if (!m) return v;
+  try { return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(Uint8Array.from(atob(m[1]), c => c.charCodeAt(0))); } catch { return null; }
+}
+const isObj = (v: unknown): v is Record<string, any> => !!v && typeof v === "object" && !Array.isArray(v);
 
 async function handleMcp(req: Request, env: Env): Promise<Response> {
   const origin = req.headers.get("Origin");
-  if (origin && origin !== ALLOWED_ORIGIN) return json({ error: "origin not allowed" }, 403);
-  if (req.method === "GET") return new Response("SSE stream not supported (stateless server)", { status: 405, headers: { Allow: "POST" } });
-  if (req.method === "DELETE") return new Response(null, { status: 405, headers: { Allow: "POST" } });
-  if (req.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
+  if (!mcpOriginAllowed(env, origin)) return json(rpcErr(null, E.INVALID_REQUEST, "Origin not allowed"), 403);
+  const cors = mcpCors(origin, req);
+  const reply = (body: unknown, status: number, extra: Record<string, string> = {}) => json(body, status, { ...cors, ...extra });
+  if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+  // Stateless server: no standalone GET SSE stream and no sessions to delete. 405 is explicitly allowed for both.
+  if (req.method !== "POST") return new Response(null, { status: 405, headers: { ...cors, Allow: "POST, OPTIONS" } });
+
+  const token = bearer(req);
   const userId = await authUser(env, req, "read");
-  if (!userId) return json({ jsonrpc: "2.0", id: null, error: { code: -32001, message: "Unauthorized: read token required" } }, 401,
-    { "WWW-Authenticate": 'Bearer realm="dutch-api"' });
-  let msg: any;
-  try { msg = await req.json(); } catch { return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400); }
-  const batch = Array.isArray(msg);
-  const msgs: any[] = batch ? msg : [msg];
-  const out: any[] = [];
-  for (const m of msgs) {
-    if (!m || m.jsonrpc !== "2.0" || typeof m.method !== "string") {
-      if (m && ("result" in m || "error" in m)) continue; // client responses: ignore
-      out.push({ jsonrpc: "2.0", id: m?.id ?? null, error: { code: -32600, message: "Invalid Request" } }); continue;
+  if (!userId) return reply(rpcErr(null, -32001, token ? "Invalid read token" : "Missing bearer token (use the app's 'Токен для Grok')"), 401,
+    { "WWW-Authenticate": token ? 'Bearer realm="dutch-mcp", error="invalid_token", error_description="unknown or rotated read token"' : 'Bearer realm="dutch-mcp"' });
+
+  const ct = (req.headers.get("Content-Type") || "").toLowerCase();
+  if (!ct.startsWith("application/json")) return reply(rpcErr(null, E.INVALID_REQUEST, "Content-Type must be application/json"), 415);
+  const accept = (req.headers.get("Accept") || "*/*").toLowerCase();
+  const sse = accept.includes("text/event-stream");
+  if (!sse && !/application\/json|application\/\*|\*\/\*/.test(accept)) return reply(rpcErr(null, E.INVALID_REQUEST, "Accept must include application/json or text/event-stream"), 406);
+
+  let body: unknown;
+  try { body = await req.json(); } catch { return reply(rpcErr(null, E.PARSE, "Parse error"), 400); }
+  const hv = req.headers.get("MCP-Protocol-Version");
+  if (hv !== null && !SUPPORTED_VERSIONS.includes(hv))
+    return reply(rpcErr(isObj(body) ? body.id : null, E.UNSUPPORTED_VERSION, "Unsupported protocol version", { supported: SUPPORTED_VERSIONS, requested: hv }), 400);
+
+  const send = (msgs: unknown[], batch: boolean, version: string) => {
+    const hdr = { ...cors, "MCP-Protocol-Version": version };
+    if (sse) {
+      const text = msgs.map(m => `event: message\ndata: ${JSON.stringify(m)}\n\n`).join("");
+      return new Response(text, { status: 200, headers: { ...hdr, "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no" } });
     }
-    if (m.id === undefined || m.id === null) continue; // notification (e.g. notifications/initialized)
-    try {
-      let result: unknown;
-      switch (m.method) {
-        case "initialize": {
-          const v = m.params?.protocolVersion;
-          result = { protocolVersion: PROTOCOL_VERSIONS.includes(v) ? v : PROTOCOL_VERSIONS[0],
-            capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: "dutch-flashcards", version: "1.0.0" },
-            instructions: "Read-only access to Pavel's Dutch flashcard progress. Levels 0-6; level >= 3 counts as known. Times are ISO UTC." };
-          break;
-        }
-        case "ping": result = {}; break;
-        case "tools/list": result = { tools: TOOLS }; break;
-        case "tools/call": {
-          const data = await callTool(env, userId, String(m.params?.name), m.params?.arguments ?? {});
-          result = { content: [{ type: "text", text: JSON.stringify(data, null, 2) }], structuredContent: data, isError: false };
-          break;
-        }
-        default: throw new RpcError(-32601, `Method not found: ${m.method}`);
-      }
-      out.push({ jsonrpc: "2.0", id: m.id, result });
-    } catch (e: any) {
-      out.push({ jsonrpc: "2.0", id: m.id, error: { code: e instanceof RpcError ? e.code : -32603, message: e?.message || "Internal error" } });
+    return json(batch ? msgs : msgs[0], 200, hdr);
+  };
+
+  // ---- legacy batch (2025-03-26 only) ----
+  if (Array.isArray(body)) {
+    if (hv !== null && hv !== "2025-03-26") return reply(rpcErr(null, E.INVALID_REQUEST, `JSON-RPC batches are not supported in protocol ${hv}`), 400);
+    if (!body.length) return reply(rpcErr(null, E.INVALID_REQUEST, "Empty batch"), 400);
+    const out: unknown[] = [];
+    for (const m of body) {
+      const r = await legacyOne({ env, userId, modern: false, version: "2025-03-26" }, m, true);
+      if (r) out.push(r.body);
     }
+    return out.length ? send(out, true, "2025-03-26") : new Response(null, { status: 202, headers: cors });
   }
-  if (!out.length) return new Response(null, { status: 202 });
-  return json(batch ? out : out[0]);
+  if (!isObj(body) || body.jsonrpc !== "2.0") return reply(rpcErr(null, E.INVALID_REQUEST, "Invalid Request"), 400);
+  if (body.method === undefined && ("result" in body || "error" in body)) return new Response(null, { status: 202, headers: cors }); // client response: accepted, ignored
+  if (typeof body.method !== "string") return reply(rpcErr(body.id, E.INVALID_REQUEST, "Invalid Request"), 400);
+
+  const meta = isObj(body.params) && isObj(body.params._meta) ? body.params._meta : undefined;
+  const mv = meta?.["io.modelcontextprotocol/protocolVersion"];
+  const isModern = body.method !== "initialize" &&
+    ((typeof mv === "string" && !LEGACY_VERSIONS.includes(mv)) || (hv !== null && MODERN_VERSIONS.includes(hv)));
+
+  if (!isModern) {
+    const version = body.method === "initialize" ? "" : (hv ?? "2025-03-26");
+    const r = await legacyOne({ env, userId, modern: false, version }, body, false);
+    if (!r) return new Response(null, { status: 202, headers: cors });
+    if (r.status !== 200) return reply(r.body, r.status);
+    return send([r.body], false, r.version);
+  }
+
+  // ---- modern request ----
+  const id = body.id;
+  const fail = (code: number, msg: string, status: number, data?: unknown) => reply(rpcErr(id, code, msg, data), status);
+  if (typeof mv !== "string") return fail(E.INVALID_PARAMS, "Missing params._meta['io.modelcontextprotocol/protocolVersion']", 400);
+  if (!MODERN_VERSIONS.includes(mv)) return fail(E.UNSUPPORTED_VERSION, "Unsupported protocol version", 400, { supported: SUPPORTED_VERSIONS, requested: mv });
+  if (hv === null) return fail(E.HEADER_MISMATCH, "Header mismatch: missing MCP-Protocol-Version header", 400);
+  if (hv !== mv) return fail(E.HEADER_MISMATCH, `Header mismatch: MCP-Protocol-Version '${hv}' does not match body '${mv}'`, 400);
+  const hm = req.headers.get("Mcp-Method");
+  if (hm === null) return fail(E.HEADER_MISMATCH, "Header mismatch: missing Mcp-Method header", 400);
+  if (hm !== body.method) return fail(E.HEADER_MISMATCH, `Header mismatch: Mcp-Method '${hm}' does not match body '${body.method}'`, 400);
+  const nameField = body.method === "tools/call" ? "name" : body.method === "resources/read" || body.method === "prompts/get" ? (body.method === "prompts/get" ? "name" : "uri") : null;
+  if (nameField) {
+    const raw = req.headers.get("Mcp-Name");
+    if (raw === null) return fail(E.HEADER_MISMATCH, "Header mismatch: missing Mcp-Name header", 400);
+    const hn = decodeHeaderValue(raw);
+    if (hn === null) return fail(E.HEADER_MISMATCH, "Header mismatch: Mcp-Name is not valid base64 UTF-8", 400);
+    if (hn !== body.params?.[nameField]) return fail(E.HEADER_MISMATCH, `Header mismatch: Mcp-Name does not match params.${nameField}`, 400);
+  }
+  if (!isObj(meta?.["io.modelcontextprotocol/clientCapabilities"])) return fail(E.INVALID_PARAMS, "Missing params._meta['io.modelcontextprotocol/clientCapabilities']", 400);
+  if (id === undefined || id === null) return new Response(null, { status: 202, headers: cors }); // modern notification
+  try {
+    const result = await dispatch({ env, userId, modern: true, version: mv }, body.method, body.params);
+    const _meta = { ...(isObj(result._meta) ? result._meta : {}), "io.modelcontextprotocol/serverInfo": SERVER_INFO };
+    return send([{ jsonrpc: "2.0", id, result: { resultType: "complete", ...result, _meta } }], false, mv);
+  } catch (e: any) {
+    if (e instanceof RpcError) return fail(e.code, e.message, e.http === 200 ? 400 : e.http, e.data);
+    return fail(E.INTERNAL, "Internal error", 500);
+  }
+}
+
+// One legacy message -> response (or null for notifications). In a batch HTTP status is always 200.
+async function legacyOne(ctx: Ctx, m: any, inBatch: boolean): Promise<{ body: unknown; status: number; version: string } | null> {
+  if (!isObj(m) || m.jsonrpc !== "2.0") return { body: rpcErr(isObj(m) ? m.id : null, E.INVALID_REQUEST, "Invalid Request"), status: inBatch ? 200 : 400, version: ctx.version };
+  if (m.method === undefined && ("result" in m || "error" in m)) return null;
+  if (typeof m.method !== "string") return { body: rpcErr(m.id, E.INVALID_REQUEST, "Invalid Request"), status: inBatch ? 200 : 400, version: ctx.version };
+  if (m.id === undefined || m.id === null) return null; // notifications/initialized, notifications/cancelled, ...
+  let version = ctx.version;
+  if (m.method === "initialize") {
+    const req = m.params?.protocolVersion;
+    version = LEGACY_VERSIONS.includes(req) ? req : LEGACY_VERSIONS[0];
+  }
+  try {
+    const result = await dispatch({ ...ctx, version }, m.method, m.params);
+    return { body: { jsonrpc: "2.0", id: m.id, result }, status: 200, version };
+  } catch (e: any) {
+    const code = e instanceof RpcError ? e.code : E.INTERNAL;
+    return { body: rpcErr(m.id, code, e instanceof RpcError ? e.message : "Internal error", e?.data), status: 200, version };
+  }
+}
+
+// ----- discovery documents -----
+function serverCard(base: string) {
+  return {
+    $schema: "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json",
+    name: "io.github.forcewake/dutch-flashcards", version: SERVER_INFO.version, title: SERVER_INFO.title,
+    description: "Read-only MCP access to a learner's Dutch flashcard progress: summary, struggling cards, due cards, current session, recent activity.",
+    websiteUrl: "https://forcewake.github.io/dutch-flashcards/",
+    repository: { url: "https://github.com/forcewake/dutch-flashcards", source: "github", subfolder: "api" },
+    remotes: [{ type: "streamable-http", url: `${base}/mcp`, supportedProtocolVersions: SUPPORTED_VERSIONS,
+      headers: [{ name: "Authorization", description: "Bearer <read token from the app's 'Токен для Grok' button>", isRequired: true, isSecret: true, value: "Bearer {token}",
+        variables: { token: { description: "Read-only token", isRequired: true, isSecret: true } } }] }],
+  };
+}
+function discoveryDoc(path: string, base: string): Response | null {
+  const h = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET", "Access-Control-Allow-Headers": "Content-Type", "Cache-Control": "public, max-age=3600" };
+  if (path === "/mcp/server-card" || path === "/.well-known/mcp.json")
+    return new Response(JSON.stringify(serverCard(base), null, 2), { headers: { ...h, "Content-Type": path === "/mcp/server-card" ? "application/mcp-server-card+json" : "application/json" } });
+  if (path === "/.well-known/ai-catalog.json")
+    return new Response(JSON.stringify({ entries: [{ identifier: "urn:air:forcewake.github.io:mcp:dutch-flashcards", type: "application/mcp-server-card+json", url: `${base}/mcp/server-card` }] }, null, 2),
+      { headers: { ...h, "Content-Type": "application/ai-catalog+json" } });
+  return null;
 }
 
 // ---------- REST ----------
@@ -679,8 +961,13 @@ export default {
     const url = new URL(req.url);
     const origin = req.headers.get("Origin");
     if (url.pathname === "/dashboard" && req.method === "GET") return dashboard();
+    if (req.method === "GET" || req.method === "OPTIONS") {
+      const d = discoveryDoc(url.pathname, url.origin);
+      if (d) return req.method === "GET" ? d : new Response(null, { status: 204, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET", "Access-Control-Allow-Headers": "Content-Type" } });
+    }
+    if (url.pathname.startsWith("/.well-known/")) return json({ error: "not found" }, 404, { "Access-Control-Allow-Origin": "*" });
     if (url.pathname === "/mcp") {
-      try { return await handleMcp(req, env); } catch { return json({ error: "internal error" }, 500); }
+      try { return await handleMcp(req, env); } catch { return json(rpcErr(null, E.INTERNAL, "Internal error"), 500); }
     }
     if (req.method === "OPTIONS") {
       if (origin !== ALLOWED_ORIGIN) return new Response(null, { status: 403 });
