@@ -23,6 +23,13 @@
   .good{background:#3a9a52;color:#fff}
   .reset{background:none;color:#999;font-size:.85rem;flex:none;margin-top:14px;text-decoration:underline}
   button:disabled{opacity:.4;cursor:default}
+  .sync{width:100%;max-width:520px;margin-top:18px;font-size:.9rem;color:#555}
+  .sync summary{cursor:pointer;color:#888}
+  .sync .box{background:#fff;border-radius:12px;padding:12px;margin-top:8px;display:flex;flex-direction:column;gap:8px}
+  .sync code{word-break:break-all;background:#f4f1ea;padding:4px 6px;border-radius:6px;font-size:.8rem}
+  .sync input{font-size:.9rem;padding:8px;border:1px solid #ddd;border-radius:8px;width:100%}
+  .sync button{font-size:.9rem;padding:8px 12px;flex:none;min-width:0;background:#e3ded3}
+  .sync .line{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -45,6 +52,17 @@
   <button class="good" id="good" disabled>✓ Знаю (2)</button>
 </div>
 <button class="reset" id="reset">Сбросить прогресс</button>
+<details class="sync" id="sync">
+  <summary>Синхронизация</summary>
+  <div class="box">
+    <div id="syncStatus">…</div>
+    <div>Код этого устройства:</div>
+    <div class="line"><code id="myCode">—</code><button id="copyCode">Копировать</button></div>
+    <div>Ввести код с другого устройства:</div>
+    <div class="line"><input id="otherCode" autocomplete="off" placeholder="код"><button id="useCode">Применить</button></div>
+    <div class="line"><button id="grokBtn">Токен для Grok</button><code id="grokTok" hidden></code></div>
+  </div>
+</details>
 
 <script>
 // [Dutch, pronunciation hint, Russian, topic]
@@ -124,27 +142,166 @@ const CARDS = [
 ];
 // Pronunciation hints: kh = гортанный "г/х", ö ≈ "ё" губами, ü ≈ "ю" коротко, ə = безударный звук.
 
-const KEY = "nl-flashcards-v1";
+// ---------- ids ----------
+// Stable card id: "nl:" + slug of the Dutch text (diacritics stripped), "-2", "-3"... on collision.
+// Same algorithm as api/scripts/slug.mjs (which generates CARD_META in the worker).
+function cardSlug(s){
+  return "nl:" + s.normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase()
+    .replace(/[^a-z0-9]+/g,"-").replace(/^-+|-+$/g,"");
+}
+const IDS = (()=>{ const seen = {}; return CARDS.map(c=>{ let b = cardSlug(c[0]), id = b, n = 2; while(seen[id]) id = b + "-" + n++; seen[id] = 1; return id; }); })();
+
+// ---------- sync config ----------
+const API_BASE = "https://dutch-api.REPLACE.workers.dev"; // set to the deployed worker URL
+const API_ON = !/REPLACE/.test(API_BASE);
+
+const KEY = "nl-flashcards-v2", OLD_KEY = "nl-flashcards-v1";
+const K_TOKEN = "nl-sync-token", K_IMPORTED = "nl-sync-imported", K_QUEUE = "nl-sync-queue", K_LAST = "nl-sync-last";
 const STEPS = [0, 1, 5, 20, 60, 180, 600]; // minutes until the card comes back, by level
 const MIN = 60000;
+const MAX_EVENTS = 2000;
 let st = load();
 let order = [], pos = 0, flipped = false;
 
-function load(){ try{ return JSON.parse(localStorage.getItem(KEY)) || {}; }catch(e){ return {}; } }
-function save(){ localStorage.setItem(KEY, JSON.stringify(st)); }
-function info(i){ return st[i] || (st[i] = {lvl:0, due:0, seen:0}); }
+function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+function lsSet(k,v){ try{ localStorage.setItem(k,v); }catch(e){} }
+function lsDel(k){ try{ localStorage.removeItem(k); }catch(e){} }
+function lsJSON(k,d){ try{ return JSON.parse(lsGet(k)) || d; }catch(e){ return d; } }
+
+// v1 {index:{lvl,due,seen}} -> v2 {slug:{level,due_at,last_seen,seen,wrong,updated_at}}
+function migrate(v1, now){
+  const out = {};
+  for(const k in v1){
+    const i = +k, o = v1[k];
+    if(!(i >= 0 && i < CARDS.length) || !o) continue;
+    if(!(o.seen > 0) && !(o.lvl > 0)) continue;
+    out[IDS[i]] = { level: o.lvl|0, due_at: +o.due||0, last_seen: 0, seen: o.seen|0, wrong: 0, updated_at: now };
+  }
+  return out;
+}
+function load(){
+  const v2 = lsJSON(KEY, null);
+  if(v2) return v2;
+  const v1 = lsJSON(OLD_KEY, null);
+  const m = v1 ? migrate(v1, Date.now()) : {};
+  lsSet(KEY, JSON.stringify(m)); // v1 key left in place as a backup
+  return m;
+}
+function save(){ lsSet(KEY, JSON.stringify(st)); }
+function blank(){ return {level:0, due_at:0, last_seen:0, seen:0, wrong:0, updated_at:0}; }
+function info(i){ return st[IDS[i]] || blank(); }
+function touch(i){ const id = IDS[i]; const s = st[id] || (st[id] = blank()); return s; }
+
+// ---------- sync queue ----------
+let queue = lsJSON(K_QUEUE, {changes:{}, events:[]});
+if(!queue.changes) queue.changes = {}; if(!Array.isArray(queue.events)) queue.events = [];
+let syncTimer = null, syncing = false, syncState = API_ON ? "" : "off";
+function saveQueue(){ lsSet(K_QUEUE, JSON.stringify(queue)); }
+function queueCard(i){ queue.changes[IDS[i]] = Object.assign({}, st[IDS[i]]); saveQueue(); schedule(); }
+function logEvent(type, i, extra){
+  const e = {type, ts: Date.now()};
+  if(i != null) e.card_id = IDS[i];
+  if(extra && "ok" in extra){ e.ok = extra.ok; delete extra.ok; }
+  if(extra && Object.keys(extra).length) e.data = extra;
+  queue.events.push(e);
+  if(queue.events.length > MAX_EVENTS) queue.events.splice(0, queue.events.length - MAX_EVENTS);
+  saveQueue(); schedule();
+}
+let posTimer = null;
+function logPosition(dir){ // debounced: rapid next/prev only logs where you land
+  clearTimeout(posTimer);
+  const i = order[pos], p = pos;
+  posTimer = setTimeout(()=>{ posTimer = null; logEvent("position", i, {pos:p, dir}); }, 800);
+}
+function schedule(){ if(!API_ON) return; clearTimeout(syncTimer); syncTimer = setTimeout(()=>sync(), 2000); }
+
+async function api(path, body, opts){
+  const t = lsGet(K_TOKEN);
+  const r = await fetch(API_BASE + path, Object.assign({
+    method: body ? "POST" : "GET",
+    headers: Object.assign({"Content-Type":"application/json"}, t ? {Authorization:"Bearer " + t} : {}),
+    body: body ? JSON.stringify(body) : undefined
+  }, opts || {}));
+  if(!r.ok){ const e = new Error("HTTP " + r.status); e.status = r.status; throw e; }
+  return r.json();
+}
+// server progress wins only when newer
+function mergeRemote(remote){
+  let changed = false;
+  for(const id in remote){
+    const r = remote[id], l = st[id];
+    if(!l || (r.updated_at||0) > (l.updated_at||0)){
+      if(queue.changes[id] && queue.changes[id].updated_at >= (r.updated_at||0)) continue;
+      st[id] = {level:r.level|0, due_at:+r.due_at||0, last_seen:+r.last_seen||0, seen:r.seen|0, wrong:r.wrong|0, updated_at:+r.updated_at||0};
+      changed = true;
+    }
+  }
+  if(changed){ save(); if(started){ const cur = order[pos]; buildOrder(); const k = order.indexOf(cur); if(k >= 0) pos = k; render(); } }
+}
+async function ensureToken(){
+  if(lsGet(K_TOKEN)) return true;
+  const r = await api("/v1/register", {});
+  lsSet(K_TOKEN, r.token); return true;
+}
+async function sync(keepalive){
+  if(!API_ON || syncing) return;
+  if(!keepalive && typeof navigator !== "undefined" && navigator.onLine === false){ setStatus("offline"); return; }
+  syncing = true; clearTimeout(syncTimer);
+  try{
+    await ensureToken();
+    if(!lsGet(K_IMPORTED)){
+      const all = {}; for(const id in st) all[id] = st[id];
+      const r = await api("/v1/import", {changes: all, events: []});
+      lsSet(K_IMPORTED, "1"); mergeRemote(r.progress);
+    }
+    const sent = queue; const ch = Object.keys(sent.changes), ev = sent.events.slice(0, 1000);
+    if(ch.length || ev.length || !keepalive){
+      const body = {changes: sent.changes, events: ev};
+      queue = {changes:{}, events: sent.events.slice(ev.length)}; saveQueue();
+      try{
+        const r = await api("/v1/sync", body, keepalive ? {keepalive:true} : undefined);
+        if(r && r.progress) mergeRemote(r.progress);
+      }catch(e){ // put it back (newer local edits win)
+        for(const id of ch) if(!queue.changes[id]) queue.changes[id] = body.changes[id];
+        queue.events = ev.concat(queue.events).slice(-MAX_EVENTS); saveQueue();
+        throw e;
+      }
+      if(queue.events.length || Object.keys(queue.changes).length) schedule();
+    }
+    lsSet(K_LAST, String(Date.now())); setStatus("ok");
+  }catch(e){
+    if(e && e.status === 401){ lsDel(K_TOKEN); lsDel(K_IMPORTED); setStatus("auth"); }
+    else setStatus("offline");
+  }finally{ syncing = false; }
+}
+function setStatus(s){ syncState = s; renderSync(); }
+function renderSync(){
+  if(typeof document === "undefined" || !$("syncStatus")) return;
+  const pend = Object.keys(queue.changes).length + queue.events.length;
+  const last = +lsGet(K_LAST);
+  let t;
+  if(!API_ON) t = "Сервер синхронизации ещё не подключён";
+  else if(syncState === "ok") t = "Синхронизировано" + (last ? " в " + new Date(last).toLocaleTimeString() : "");
+  else if(syncState === "offline") t = "Нет связи с сервером — изменения сохранятся и отправятся позже";
+  else if(syncState === "auth") t = "Код не принят сервером — будет создан новый";
+  else t = "Синхронизация…";
+  if(API_ON && pend) t += ` · в очереди: ${pend}`;
+  $("syncStatus").textContent = t;
+  $("myCode").textContent = lsGet(K_TOKEN) || "—";
+  for(const b of ["copyCode","useCode","grokBtn"]) $(b).disabled = !API_ON;
+}
 
 function buildOrder(){
   const now = Date.now();
   const idx = CARDS.map((_,i)=>i);
-  const due = idx.filter(i=>info(i).due <= now).sort((a,b)=>info(a).due-info(b).due || info(a).lvl-info(b).lvl);
-  const later = idx.filter(i=>info(i).due > now).sort((a,b)=>info(a).due-info(b).due);
+  const due = idx.filter(i=>info(i).due_at <= now).sort((a,b)=>info(a).due_at-info(b).due_at || info(a).level-info(b).level);
+  const later = idx.filter(i=>info(i).due_at > now).sort((a,b)=>info(a).due_at-info(b).due_at);
   order = due.concat(later); pos = 0;
 }
 
 function render(){
   const i = order[pos], c = CARDS[i], s = info(i);
-  $("tag").textContent = c[3] + " · уровень " + s.lvl;
+  $("tag").textContent = c[3] + " · уровень " + s.level;
   $("nl").textContent = c[0];
   $("ph").textContent = "[" + c[1] + "]";
   $("ru").textContent = flipped ? c[2] : "";
@@ -152,16 +309,20 @@ function render(){
   $("good").disabled = $("bad").disabled = !flipped;
   $("prev").disabled = pos === 0;
   const now = Date.now();
-  const dueN = CARDS.filter((_,k)=>info(k).due <= now).length;
-  const known = CARDS.filter((_,k)=>info(k).lvl >= 3).length;
+  const dueN = CARDS.filter((_,k)=>info(k).due_at <= now).length;
+  const known = CARDS.filter((_,k)=>info(k).level >= 3).length;
   $("stats").textContent = `Карточка ${pos+1}/${order.length} · к повторению: ${dueN} · выучено: ${known}/${CARDS.length}`;
+  renderSync();
 }
 
 function answer(ok){
-  const s = info(order[pos]);
-  s.lvl = ok ? Math.min(s.lvl + 1, STEPS.length - 1) : 0;
-  s.due = Date.now() + (ok ? STEPS[s.lvl] * MIN : 0);
-  s.seen++; save();
+  const ci = order[pos], s = touch(ci), now = Date.now();
+  s.level = ok ? Math.min(s.level + 1, STEPS.length - 1) : 0;
+  s.due_at = now + (ok ? STEPS[s.level] * MIN : 0);
+  s.seen++; if(!ok) s.wrong++;
+  s.last_seen = now; s.updated_at = now; save();
+  logEvent("answer", ci, {ok, level: s.level});
+  queueCard(ci);
   if(!ok){ // unknown: show it again 3 cards later
     const id = order.splice(pos,1)[0];
     order.splice(Math.min(pos+3, order.length), 0, id);
@@ -170,24 +331,59 @@ function answer(ok){
   }
   if(pos >= order.length) buildOrder();
   flipped = false; render();
+  logPosition("auto");
 }
 
 function $(id){ return document.getElementById(id); }
-function flip(){ flipped = !flipped; render(); }
-$("card").onclick = flip; $("flip").onclick = flip;
-$("next").onclick = ()=>{ pos = (pos+1) % order.length; flipped=false; render(); };
-$("prev").onclick = ()=>{ if(pos>0){pos--; flipped=false; render();} };
-$("good").onclick = ()=>answer(true);
-$("bad").onclick = ()=>answer(false);
-$("reset").onclick = ()=>{ if(confirm("Сбросить весь прогресс?")){ st={}; save(); buildOrder(); flipped=false; render(); } };
-document.addEventListener("keydown", e=>{
-  if(e.key===" "){ e.preventDefault(); flip(); }
-  else if(e.key==="ArrowRight") $("next").click();
-  else if(e.key==="ArrowLeft") $("prev").click();
-  else if(e.key==="1" && flipped) answer(false);
-  else if(e.key==="2" && flipped) answer(true);
-});
-buildOrder(); render();
+function flip(){ flipped = !flipped; render(); logEvent("flip", order[pos], {shown: flipped}); }
+let started = false;
+function start(){
+  $("card").onclick = flip; $("flip").onclick = flip;
+  $("next").onclick = ()=>{ pos = (pos+1) % order.length; flipped=false; render(); logPosition("next"); };
+  $("prev").onclick = ()=>{ if(pos>0){pos--; flipped=false; render(); logPosition("prev");} };
+  $("good").onclick = ()=>answer(true);
+  $("bad").onclick = ()=>answer(false);
+  $("reset").onclick = ()=>{ if(confirm("Сбросить весь прогресс?")){
+    const now = Date.now();
+    for(const id in st){ st[id] = Object.assign(blank(), {updated_at: now}); queue.changes[id] = Object.assign({}, st[id]); }
+    save(); saveQueue(); schedule(); buildOrder(); flipped=false; render(); } };
+  document.addEventListener("keydown", e=>{
+    if(e.target && e.target.tagName === "INPUT") return;
+    if(e.key===" "){ e.preventDefault(); flip(); }
+    else if(e.key==="ArrowRight") $("next").click();
+    else if(e.key==="ArrowLeft") $("prev").click();
+    else if(e.key==="1" && flipped) answer(false);
+    else if(e.key==="2" && flipped) answer(true);
+  });
+  // sync panel
+  $("copyCode").onclick = async ()=>{ const t = lsGet(K_TOKEN); if(!t) return;
+    try{ await navigator.clipboard.writeText(t); $("copyCode").textContent = "Скопировано"; }catch(e){ prompt("Скопируйте код:", t); }
+    setTimeout(()=>$("copyCode").textContent = "Копировать", 1500); };
+  $("useCode").onclick = async ()=>{
+    const c = $("otherCode").value.trim(); if(!c || !API_ON) return;
+    if(!confirm("Подключить это устройство к другому коду? Прогресс будет объединён с сервером.")) return;
+    lsSet(K_TOKEN, c); lsSet(K_IMPORTED, "1"); // keep local queue; it gets pushed to the new account
+    for(let i = 0; i < CARDS.length; i++) if(st[IDS[i]] && st[IDS[i]].seen) queue.changes[IDS[i]] = Object.assign({}, st[IDS[i]]);
+    saveQueue(); $("otherCode").value = "";
+    try{ const r = await api("/v1/progress"); mergeRemote(r.progress); }catch(e){ if(e.status === 401){ setStatus("auth"); return; } }
+    sync();
+  };
+  $("grokBtn").onclick = async ()=>{
+    if(!confirm("Создать новый токен для Grok? Старый токен перестанет работать.")) return;
+    try{ await ensureToken(); const r = await api("/v1/read-token", {}); $("grokTok").textContent = r.readToken; $("grokTok").hidden = false; }
+    catch(e){ $("grokTok").textContent = "Не удалось получить токен"; $("grokTok").hidden = false; }
+  };
+  document.addEventListener("visibilitychange", ()=>{ if(document.visibilityState === "hidden"){
+    if(posTimer){ clearTimeout(posTimer); posTimer = null; logEvent("position", order[pos], {pos, dir:"flush"}); }
+    sync(true); } });
+  if(typeof window !== "undefined") window.addEventListener("online", ()=>sync());
+  buildOrder(); render(); started = true;
+  logEvent("session_start", null, {ua: (navigator.userAgent||"").slice(0,80)});
+  if(API_ON){
+    ensureToken().then(()=>api("/v1/progress")).then(r=>mergeRemote(r.progress)).catch(()=>{}).then(()=>sync());
+  } else { renderSync(); }
+}
+start();
 </script>
 </body>
 </html>
