@@ -142,3 +142,11 @@ curl -so /dev/null -w '%{http_code}\n' -X POST $B/mcp -H "Authorization: Bearer 
 
 Grok MCP config: URL `$B/mcp`, header `Authorization: Bearer <read token from the app's "Токен для Grok" button>`.
 Dashboard: `$B/dashboard`.
+
+### Deployed instance / deploying without wrangler auth
+
+Live: `https://dutch-api.forcewake.workers.dev` (D1 `dutch`, id in `wrangler.toml`). It was first deployed without a
+`CLOUDFLARE_API_TOKEN` through the Cloudflare API: `POST /accounts/{id}/d1/database`, schema via `.../d1/database/{db}/query`,
+bundle from `npx wrangler deploy --dry-run --outdir dist`, uploaded with `PUT .../workers/scripts/dutch-api` (multipart,
+`main_module: index.js`, bindings `d1 DB` + `plain_text MCP_ALLOWED_ORIGINS`), then `POST .../workers/scripts/dutch-api/subdomain {"enabled":true}`.
+A plain `npx wrangler deploy` with credentials does the same thing.

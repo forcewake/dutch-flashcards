@@ -5,7 +5,7 @@ compatibility_date = "2025-01-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "dutch"
-database_id = "00000000-0000-0000-0000-000000000000" # REPLACE with id from `wrangler d1 create dutch`
+database_id = "83adc567-4425-4422-a18d-dcfce61c9074"
 
 [vars]
 # Origins allowed to call /mcp from a browser (comma-separated, or "*"). Requests without Origin are always allowed.

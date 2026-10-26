@@ -152,7 +152,7 @@ function cardSlug(s){
 const IDS = (()=>{ const seen = {}; return CARDS.map(c=>{ let b = cardSlug(c[0]), id = b, n = 2; while(seen[id]) id = b + "-" + n++; seen[id] = 1; return id; }); })();
 
 // ---------- sync config ----------
-const API_BASE = "https://dutch-api.REPLACE.workers.dev"; // set to the deployed worker URL
+const API_BASE = "https://dutch-api.forcewake.workers.dev"; // set to the deployed worker URL
 const API_ON = !/REPLACE/.test(API_BASE);
 
 const KEY = "nl-flashcards-v2", OLD_KEY = "nl-flashcards-v1";
